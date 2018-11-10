@@ -10,6 +10,8 @@ import ftdi1 as ftdi
 import time
 
 
+
+
 def bcc(i):
   bytes = map(ord, i)
   res = reduce(lambda x, y: x ^ y, bytes)
@@ -53,7 +55,152 @@ pcConnectionModeResponse = encodeShort("00", "54", "    ")
 setMeasurementConditions01 = encodeShort("01", "10", "0200")
 #setMeasurementConditions01Response = encodeShort("01", "10", "   0")
 
+class FtdiContext:
+
+  __vendorID = 0x0403
+  __productID = 0x6001
+
+  class FtdiContextException(Exception): pass
+
+  def __assertFtdi(self, name, ret):
+    if ret < 0:
+      raise FtdiContext("ftdi.%s failed: %d (%s)" % (name, ret, ftdi.get_error_string(self.ftdic)))
+
+  def __init__(self):
+    self.ftdic = ftdi.new()
+    self.__assertFtdi("usb_open", ftdi.usb_open(self.ftdic, __vendorID, __productID))
+    self.__assertFtdi("setflowctrl", ftdi.setflowctrl(self.ftdic, ftdi.SIO_XON_XOFF_HS))
+    self.__assertFtdi("set_bitmode", ftdi.set_bitmode(self.ftdic, 0xff, ftdi.BITMODE_RESET))
+    self.__assertFtdi("set_baudrate", ftdi.set_baudrate(self.ftdic, 9600))
+    self.__assertFtdi("set_line_property", ftdi.set_line_property(self.ftdic, ftdi.BITS_7, ftdi.STOP_BIT_1, ftdi.EVEN))
+
+  def __del__(self):
+    self.__assertFtdi("usb_close", ftdi.usb_close(self.ftdic))
+    ftdi.free(ftdic)
+
+  def writeData(data):
+    self.__assertFtdi("write_data", ftdi.write_data(self.ftdic, data))
+
+  def readData(length):
+    ret, d = ftdi.read_data(ftdic, length)
+    self.__assertFtdi("read_data", ret)
+    return d
+
+
+# IlluminanceMeterT10A
+class Messenger:
+
+  __messageLengthShort = 14
+  __messageLengthLong = 32
+
+  class MessengerException(Exception): pass
+
+  def computeBcc(i):
+    bytes = map(ord, i)
+    res = reduce(lambda x, y: x ^ y, bytes)
+    return "%02x" % res
+
+  def messageEncodeShort(receptorHead, command, parameter):
+    bccable = ("%02d" % receptorHead) + command + parameter + "\x03" # 0x03 for ETX
+    bccResult = computeBcc(bccable)
+    return "\x02" + bccable + bccResult + "\x0D\x0A" # \x02 for STX, \x0D for CR, \x0A for LF
+
+  def __assertBcc(bccable, actualBcc, i):
+    expectedBcc = computeBcc(bccable)
+    if int(actualBcc, 16) != int(expectedBcc, 16):
+      raise MessengerException("BCC check failed, expected BCC '%s', got '%s', received '%s'." % (expectedBcc, actualBcc, i))
+
+  def messageDecodeShort(i):
+    __assertBcc(i[1:10], i[10:12], i)
+    receptorHead = int(i[1:3])
+    command = i[3:5]
+    parameter = i[5:9]
+    return (receptorHead, command, parameter)
+
+  def messageDecodeLong(i):
+    def dataToNumber(i):
+      if i == "      ":
+        return None
+      else:
+        v = int(i[1:5])
+        e = int(i[5]) - 4
+        r = v * (10**e)
+        return -r if i[0] == '-' else r
+    __assertBcc(i[1:28], i[28:30], i)
+    receptorHead = int(i[1:3])
+    command = i[3:5]
+    status = i[5:9]
+    data1 = dataToNumber(i[9:15])
+    data2 = dataToNumber(i[15:21])
+    data3 = dataToNumber(i[21:27])
+    return (receptorHead, command, status, (data1, data2, data3))
+
+  def sendShort(receptorHeadNumber, command, parameter):
+    encoded = messageEncodeShort(receptorHeadNumber, command, parameter)
+    self.ftdic.writeData(encoded)
+
+  def receiveShort():
+    encoded = self.ftdic.readData(__messageLengthShort)
+    return messageDecodeShort(encoded)
+
+  def receiveLong():
+    encoded = self.ftdic.readData(__messageLengthLong)
+    return messageDecodeLong(encoded)
+
+  def __init__(self, ftdic):
+    self.ftdic = ftdic
+
+
+class Protocol:
+
+  class ProtocolException(Exception): pass
+
+  def switchToPcConnectionMode(self):
+    self.messenger.sendShort(0, "54", "1   ")
+    responseActual = self.messenger.receiveShort()
+    responseExpected = (0, "54", "    ")
+    if responseActual != responseExpected:
+      raise ProtocolException('wrong PcConnectionMode response, expected "%s", got "%s".' % (responseExpected, responseActual))
+
+  def __init__(self, messenger):
+    self.messenger = messenger
+
+
+
+def allocateResources():
+  ftdic = ftdi.new()
+  if ftdic == 0:
+    raise Exception('ftdi.new failed: %d' % ret)
+  assertFtdi("usb_open", ftdi.usb_open(ftdic, vendorID, productID), ftdic)
+  return ftdic
+
+
+def initializeResources():
+  assertFtdi("setflowctrl", ftdi.setflowctrl(ftdic, ftdi.SIO_XON_XOFF_HS), ftdic)
+  assertFtdi("set_bitmode", ftdi.set_bitmode(ftdic, 0xff, ftdi.BITMODE_RESET), ftdic)
+  assertFtdi("set_baudrate", ftdi.set_baudrate(ftdic, 9600), ftdic)
+  assertFtdi("set_line_property", ftdi.set_line_property(ftdic, ftdi.BITS_7, ftdi.STOP_BIT_1, ftdi.EVEN), ftdic)
+
+
+def freeResources(ftdic):
+  if ftdic != None:
+    ftdi.usb_close(ftdic)
+    ftdi.free(ftdic)
+
+
 def main():
+  while True:
+    ftdic = None
+    try:
+      ftdic = allocateResources()
+    except Exception, e:
+      print(str(e), file=sys.stderr)
+    finally:
+      freeResources(ftdic)
+      time.sleep(15)
+
+
+def main2():
 
   # version
   print ('version: %s\n' % ftdi.__version__)
@@ -178,6 +325,8 @@ def main():
 
   print ('device closed')
   ftdi.free(ftdic)
+
+
 
 if __name__ == "__main__":
     main()
